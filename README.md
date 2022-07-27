@@ -21,6 +21,7 @@ On top of it, it can detect the face (albeit being rather slow)
 python canon_webcam.py --face | ffmpeg -i - -vcodec rawvideo -pix_fmt yuv420p -threads 0 -f v4l2 /dev/video2
 ```
 N.B. this feature is not working
+
 And the holy grail and main motivation for the whole effort, autofocus so that face is allways in focus (even with famous nifty fifty lens)
 ```bash
 python canon_webcam.py --face_autofocus | ffmpeg -i - -vcodec rawvideo -pix_fmt yuv420p -threads 0 -f v4l2 /dev/video2
