@@ -1,0 +1,3 @@
+gphoto2
+pillow
+pynput
