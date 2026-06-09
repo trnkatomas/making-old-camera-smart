@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 import sys
 import time
+import threading
+import queue
 from pynput import keyboard
 import argparse
 
@@ -18,13 +20,16 @@ camera = gp.Camera()
 
 camera.init()
 
-zoom_queue = []
-store_queue = []
-stats_queue = []
+# Protects all camera operations (libgphoto2 is not thread-safe).
+camera_lock = threading.Lock()
+
+# Thread-safe command queues (keyboard callbacks run in a separate thread).
+zoom_queue = queue.Queue()
+store_queue = queue.Queue()
+stats_queue = queue.Queue()
+
 near, far, near_small_step, far_small_step = 2, 6, 0, 4
 
-#tracker = cv2.TrackerCSRT_create()
-#tracker = cv2.TrackerKCF_create()
 tracker = cv2.TrackerMOSSE_create()
 
 def set_viewfinder():
@@ -33,14 +38,12 @@ def set_viewfinder():
     widget = gp.check_result(gp.gp_widget_get_child_by_name(config, param))
     gp.gp_widget_set_value(widget, 1)
 
-#def focus(closer=True, near=2, far=6, custom=None):
-def focus(closer=True, small_step=False,
-          custom=None, debug=False):
+def focus(closer=True, small_step=False, custom=None, debug=False):
     config = camera.get_config()
     param = 'manualfocusdrive'
     if small_step:
         choice = near_small_step if closer else far_small_step
-    else:    
+    else:
         choice = near if closer else far
     if custom:
         choice = custom
@@ -53,7 +56,7 @@ def focus(closer=True, small_step=False,
 
 def get_value():
     config = camera.get_config()
-    param = 'manualfocusdrive'    
+    param = 'manualfocusdrive'
     widget = gp.check_result(gp.gp_widget_get_child_by_name(config, param))
     return gp.gp_widget_get_value(widget)
 
@@ -71,33 +74,29 @@ def get_preview_as_image(camera, raw=False):
 def ensure_capture_to_RAM():
     cfg = camera.get_config()
     capturetarget_cfg = cfg.get_child_by_name('capturetarget')
-    capturetarget = capturetarget_cfg.get_value()
     capturetarget_cfg.set_value('Internal RAM')
-    # camera dependent - 'imageformat' is 'imagequality' on some
     imageformat_cfg = cfg.get_child_by_name('imageformat')
-    imageformat = imageformat_cfg.get_value()
     imageformat_cfg.set_value('Small Fine JPEG')
     camera.set_config(cfg)
-        
+
 cascPath = "haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 def on_press(key):
     try:
         if key.char == 's':
-            store_queue.append('s')
+            store_queue.put_nowait('s')
         elif key.char == 'c':
-            stats_queue.append('c')
+            stats_queue.put_nowait('c')
     except AttributeError:
         if key == keyboard.Key.page_down:
-            zoom_queue.append('w')
+            zoom_queue.put_nowait('w')
         elif key == keyboard.Key.page_up:
-            zoom_queue.append('t')
+            zoom_queue.put_nowait('t')
         print('special key {0} pressed'.format(key), file=sys.stderr)
 
 def on_release(key):
     if key == keyboard.Key.esc:
-        # Stop listener
         return False
 
 def get_face(image, debug=False, BB=False, debug_wait=False):
@@ -108,35 +107,31 @@ def get_face(image, debug=False, BB=False, debug_wait=False):
         scaleFactor=1.1,
         minNeighbors=5,
         minSize=(30, 30)
-        #flags = cv2.CV_HAAR_SCALE_IMAGE
-    )    
-    if debug:        
+    )
+    if debug:
         for (x, y, w, h) in faces:
             cv2.rectangle(color, (x, y), (x+w, y+h), (0, 255, 0), 2)
         if debug_wait:
-            print("Found {0} faces!".format(len(faces)))    
+            print("Found {0} faces!".format(len(faces)))
             cv2.imshow("Faces found", color)
             cv2.waitKey(0)
         else:
             if BB:
                 return color, (x, y, w, h)
             return color
-    for (x, y, w, h) in faces:  
+    for (x, y, w, h) in faces:
         img = color[y:y+h, x:x+w]
         if BB:
             return img, (x, y, w, h)
         return img
-        
-    else:
-        None
 
 def get_face_frame(image, border_width=5):
-    # rely on that the only pixel with face are the one created previously by opencv    
     border = np.where(image[:,:,1]==255)
     if border[0].size > 0:
-        min_x, min_y = np.argmin(border,axis=1)
-        max_x, max_y = np.argmax(border,axis=1)
-        return image[border[0][min_x]+border_width:border[0][max_x]-border_width, border[1][min_y]+border_width:border[1][max_y]-border_width, :]  
+        min_x, min_y = np.argmin(border, axis=1)
+        max_x, max_y = np.argmax(border, axis=1)
+        return image[border[0][min_x]+border_width:border[0][max_x]-border_width,
+                     border[1][min_y]+border_width:border[1][max_y]-border_width, :]
 
 def get_bluriness(image):
     return cv2.Laplacian(image, cv2.CV_64F).var()
@@ -154,7 +149,7 @@ def CMSL(image, window=3):
     'Robust Automatic Focus Algorithm for Low Contrast Images
     Using a New Contrast Measure'
     by Xu et Al. doi:10.3390/s110908281
-    window: window size= window X window"""
+    """
     ky1 = np.array(([0.0, -1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]))
     ky2 = np.array(([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]))
     kx1 = np.array(([0.0, 0.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 0.0, 0.0]))
@@ -163,11 +158,7 @@ def CMSL(image, window=3):
             abs(cv2.filter2D(image, cv2.CV_32F, ky1)) + \
             abs(cv2.filter2D(image, cv2.CV_32F, kx2)) + \
             abs(cv2.filter2D(image, cv2.CV_32F, ky2))
-    return cv2.boxFilter(
-                            g_img * g_img,
-                            -1,
-                            (window, window),
-                            normalize=True)
+    return cv2.boxFilter(g_img * g_img, -1, (window, window), normalize=True)
 
 
 def SML(image, window_size=3, threshold=7):
@@ -176,16 +167,12 @@ def SML(image, window_size=3, threshold=7):
     'Depth Map Estimation Using Multi-Focus Imaging'
     by Mendapara
     """
-    # kernels in x- and y -direction for Laplacian
     ky = np.array(([0.0, -1.0, 0.0], [0.0, 2.0, 0.0], [0.0, -1.0, 0.0]))
     kx = np.array(([0.0, 0.0, 0.0], [-1.0, 2.0, -1.0], [0.0, 0.0, 0.0]))
-    # add absoulte of image convolved with kx to absolute
-    # of image convolved with ky (modified laplacian)
     ml_img = abs(cv2.filter2D(image, cv2.CV_32F, kx)) + \
             abs(cv2.filter2D(image, cv2.CV_32F, ky))
-    # sum up all values that are bigger than threshold in window
     ret, img_t = cv2.threshold(ml_img, threshold, 0.0, cv2.THRESH_TOZERO)
-    return cv2.boxFilter(img_t,-1, (window_size, window_size), normalize=False)
+    return cv2.boxFilter(img_t, -1, (window_size, window_size), normalize=False)
 
 def GLV(image, window_size=3):
     """
@@ -193,33 +180,21 @@ def GLV(image, window_size=3):
     'Depth Map Estimation Using Multi-Focus Imaging'
     by Mendapara
     """
-    # calculate mean for each window
-    mean = cv2.boxFilter(image,
-                         cv2.CV_32F,
-                         (window_size, window_size),
-                         normalize=True)
-    # return variance=(img[x,y]-mean[x,y])^2
+    mean = cv2.boxFilter(image, cv2.CV_32F, (window_size, window_size), normalize=True)
     return (image - mean)**2.0
 
 
 def tenengrad1(image, window_size=3, threshold=7):
     """
-    Tenengrad2b: squared gradient absolute thresholded and 
-    summed up in each window
-    according to
+    Tenengrad2b: squared gradient absolute thresholded and
+    summed up in each window according to
     'Autofocusing Algorithm Selection in Computer Microscopy'
     by Sun et Al.
     """
-    # calculate gradient magnitude:
     S = cv2.Sobel(image, cv2.CV_32F, 1, 0, 3)**2.0 + \
         cv2.Sobel(image, cv2.CV_32F, 0, 1, 3)**2.0
-    # threshold image
     ret, dst = cv2.threshold(S, threshold, 0.0, cv2.THRESH_TOZERO)
-    # return thresholded image summed up in each window:
-    return cv2.boxFilter(dst,
-                         -1,
-                         (window_size, window_size),
-                         normalize=False)
+    return cv2.boxFilter(dst, -1, (window_size, window_size), normalize=False)
 
 def jaehne(image, window_size=3):
     """Only implemented for window_size 3 or 5 according to
@@ -264,11 +239,13 @@ def eval_frame(debug=False):
 def make_sharpness_graph(values_per_focus_step=5):
     time.sleep(3)
     for i in range(20):
-            focus(False)            
-    for i in range(130):  
-        contrast, contrast_all, blur, blur_all = 0,0,0,0
+        with camera_lock:
+            focus(False)
+    for i in range(130):
+        contrast, contrast_all, blur, blur_all = 0, 0, 0, 0
         for j in range(values_per_focus_step):
-            im = get_preview_as_image(camera)
+            with camera_lock:
+                im = get_preview_as_image(camera)
             face = get_face(im, debug=True)
             just_face = get_face_frame(face)
             if just_face is not None and just_face.size > 0:
@@ -276,119 +253,242 @@ def make_sharpness_graph(values_per_focus_step=5):
                 contrast_all += get_contrast(face)
                 blur += get_bluriness(just_face)
                 blur_all += get_bluriness(face)
-                focus()
-        print("\t".join([f"{x/values_per_focus_step}" for x in [contrast,contrast_all,blur,blur_all]]),
-                file=sys.stderr)                
+                with camera_lock:
+                    focus()
+        print("\t".join([f"{x/values_per_focus_step}" for x in [contrast, contrast_all, blur, blur_all]]),
+              file=sys.stderr)
 
-def capture_face(camera, im=None, raw=True, debug=True):
-    if not im:
-        im = get_preview_as_image(camera, raw=True)
+def capture_face(camera, im=None):
+    if im is None:
+        with camera_lock:
+            im = get_preview_as_image(camera, raw=True)
     image = Image.open(im)
-    image.load()    
-    face, bb = get_face(image, debug=True, BB=True)   
+    image.load()
+    result = get_face(image, debug=True, BB=True)
+    if result is None:
+        return im, None, None
+    face, bb = result
     return im, face, bb
 
-def process_stas_queue(stats_queue, face):
-    stats_queue.pop()
+
+# ---------------------------------------------------------------------------
+# Threading helpers
+# ---------------------------------------------------------------------------
+
+def _capture_worker(frame_queue, stop_event):
+    """Dedicated capture thread: pumps raw JPEG frames as fast as possible.
+
+    Uses a bounded queue with drop-oldest semantics so the main thread always
+    gets the most recent frame even when it falls behind momentarily.
+    """
+    while not stop_event.is_set():
+        with camera_lock:
+            raw = get_preview_as_image(camera, raw=True)
+        if raw is None:
+            continue
+        if frame_queue.full():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        frame_queue.put_nowait(raw)
+
+
+def _cv_worker(cv_queue, cv_result, cv_lock, stop_event):
+    """CV thread: face detection without blocking the capture loop.
+
+    Writes the latest (face_image, bounding_box) into cv_result[0] under
+    cv_lock.  Designed to lag behind; the main thread feeds it on a
+    best-effort basis.
+    """
+    while not stop_event.is_set():
+        try:
+            raw_bytes = cv_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        image = Image.open(io.BytesIO(raw_bytes))
+        image.load()
+        result = get_face(image, debug=True, BB=True)
+        with cv_lock:
+            cv_result[0] = result  # (face_img, bb) or None
+
+
+def _tracker_worker(cv_queue, cv_result, cv_lock, stop_event):
+    """CV thread variant for autofocus mode: runs MOSSE tracker.
+
+    Falls back to Haar detection when the tracker loses the subject.
+    """
+    local_tracker = cv2.TrackerMOSSE_create()
+    tracker_initialized = False
+
+    while not stop_event.is_set():
+        try:
+            raw_bytes = cv_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        frame = cv2.cvtColor(np.array(Image.open(io.BytesIO(raw_bytes))), cv2.COLOR_RGB2BGR)
+
+        if not tracker_initialized:
+            image = Image.open(io.BytesIO(raw_bytes))
+            image.load()
+            result = get_face(image, debug=True, BB=True)
+            if result is not None:
+                _, bb = result
+                local_tracker = cv2.TrackerMOSSE_create()
+                local_tracker.init(frame, bb)
+                tracker_initialized = True
+            continue
+
+        success, box = local_tracker.update(frame)
+        if success:
+            (x, y, w, h) = [int(v) for v in box]
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            with cv_lock:
+                cv_result[0] = (frame, (x, y, w, h))
+        else:
+            tracker_initialized = False
+            with cv_lock:
+                cv_result[0] = None
+
+
+def _handle_keyboard_queues(images, last_raw_bytes):
+    """Process keyboard command queues; must only be called from main thread."""
+    if not zoom_queue.empty():
+        cmd = zoom_queue.get_nowait()
+        with camera_lock:
+            focus(closer=(cmd == 't'))
+        print(f"Focus {'near' if cmd == 't' else 'far'}", file=sys.stderr)
+
+    if not store_queue.empty():
+        store_queue.get_nowait()
+        path = f'/tmp/face_{images}.jpeg'
+        print(f"Storing to {path}", file=sys.stderr)
+        with open(path, 'wb') as f:
+            f.write(last_raw_bytes)
+
+    if not stats_queue.empty():
+        stats_queue.get_nowait()
+        # Stats are computed from the most recent CV result in the caller.
+
+
+def _print_stats(cv_result, cv_lock):
+    with cv_lock:
+        result = cv_result[0]
+    if result is None:
+        print("No face detected for stats", file=sys.stderr)
+        return
+    face, _ = result
     just_face = get_face_frame(face)
     if just_face is not None and just_face.size > 0:
         all_stats = get_picture_stats(face)
         all_stats_face = get_picture_stats(just_face)
-        print(f"Stats:\n", file=sys.stderr)
+        print("Stats:", file=sys.stderr)
         print("all_stats:", '\n\t'.join([str(x) for x in all_stats]), file=sys.stderr)
-        print("all_stats_face", '\n\t'.join([str(x) for x in all_stats_face]), file=sys.stderr)
+        print("all_stats_face:", '\n\t'.join([str(x) for x in all_stats_face]), file=sys.stderr)
 
-def manual_focus():
-    command = zoom_queue.pop()
-    if command == 't':
-        focus()
-        print(f"Zoomed in", file=sys.stderr)
-    elif command == 'w':
-        focus(False)  
-        print(f"Zoomed out", file=sys.stderr)
 
-# blur > 50, contrast > 0.97
+# ---------------------------------------------------------------------------
+# Main capture modes
+# ---------------------------------------------------------------------------
+
 def live_capture():
+    ensure_capture_to_RAM()
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    frame_queue = queue.Queue(maxsize=2)
+    cv_queue = queue.Queue(maxsize=1)
+    cv_result = [None]  # mutable container so the CV thread can update it
+    cv_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    capture_thread = threading.Thread(
+        target=_capture_worker, args=(frame_queue, stop_event), daemon=True)
+    cv_thread = threading.Thread(
+        target=_cv_worker, args=(cv_queue, cv_result, cv_lock, stop_event), daemon=True)
+    capture_thread.start()
+    cv_thread.start()
+
     images = 0
     time_start = time.time()
-    ensure_capture_to_RAM()
-    # ...or, in a non-blocking fashion:
-    listener = keyboard.Listener(
-      on_press=on_press,
-      on_release=on_release)
-    listener.start()
-    while True:
-        try:            
-            if images % 10 == 0:
-                # output with detected face            
-                last_face = face                      
-                im, face, bb = capture_face(camera)                        
-                sys.stdout.buffer.write(im.getvalue())
-                sys.stdout.flush()
-            else:
-                # The most simple raw output
-                by = get_preview_as_image(camera, raw=True)  
-                if by:
-                    sys.stdout.buffer.write(by.getvalue())
-                    sys.stdout.flush()
-            images += 1           
-            if zoom_queue:
-                manual_focus(zoom_queue)                              
-            if store_queue:
-                store_queue.pop()
-                print(f"storring to /tmp/face_{images}.jpeg", file=sys.stderr)
-                with open(f'/tmp/face_{images}.jpeg','wb') as ofile:
-                    ofile.write(by.getvalue())
-            if stats_queue:
-                process_stats_queue(stats_queue, face)
-        except KeyboardInterrupt:
-            time_end = time.time()
-            seconds = time_end - time_start
-            print("Processed images {}".format(images), file=sys.stderr)
-            print("This is {:.2f}".format(images/seconds), file=sys.stderr)
-            sys.stderr.flush()
-            sys.exit()
-            #time.sleep(0.05)
+    last_raw_bytes = b''
+
+    try:
+        while True:
+            raw = frame_queue.get()
+            last_raw_bytes = raw.getvalue()
+            sys.stdout.buffer.write(last_raw_bytes)
+            sys.stdout.flush()
+            images += 1
+
+            # Feed the CV thread every 10 frames; non-blocking so capture is never stalled.
+            if images % 10 == 0 and not cv_queue.full():
+                cv_queue.put_nowait(last_raw_bytes)
+
+            _handle_keyboard_queues(images, last_raw_bytes)
+
+            if not stats_queue.empty():
+                stats_queue.get_nowait()
+                _print_stats(cv_result, cv_lock)
+
+    except KeyboardInterrupt:
+        stop_event.set()
+        seconds = time.time() - time_start
+        print("Processed images {}".format(images), file=sys.stderr)
+        print("This is {:.2f} fps".format(images / seconds), file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit()
+
 
 def live_capture_autofocus():
-    images = 0
-    tracker_initialized = False
-    time_start = time.time()
     ensure_capture_to_RAM()
-    im, face, bb = capture_face(camera)
-    if bb is not None:
-        tracker.init(face, bb)
-        tracker_initialized = True
 
-    while True:
-        try:
-            # output with detected face            
-            last_face = face     
-            im = get_preview_as_image(camera, raw=True)     
-            images += 1 
-            if images % 5 == 0:                         
-                if not tracker_initialized:
-                    im, face, bb = capture_face(camera, im)                        
-                    tracker.init(face, bb)                            
-                frame = cv2.cvtColor(np.array(Image.open(im)), cv2.COLOR_RGB2BGR)  
-                (success, box) = tracker.update(frame)
-                if success:
-                    (x, y, w, h) = [int(v) for v in box]
-                    print(f"rect {(x, y)}, {(x + w, y + h)}", file=sys.stderr)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2) 
-                sys.stdout.buffer.write(frame.tostring())
-                sys.stdout.flush()
+    frame_queue = queue.Queue(maxsize=2)
+    cv_queue = queue.Queue(maxsize=1)
+    cv_result = [None]
+    cv_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    capture_thread = threading.Thread(
+        target=_capture_worker, args=(frame_queue, stop_event), daemon=True)
+    tracker_thread = threading.Thread(
+        target=_tracker_worker, args=(cv_queue, cv_result, cv_lock, stop_event), daemon=True)
+    capture_thread.start()
+    tracker_thread.start()
+
+    images = 0
+    time_start = time.time()
+
+    try:
+        while True:
+            raw = frame_queue.get()
+            raw_bytes = raw.getvalue()
+            images += 1
+
+            # Feed tracker every 5 frames; non-blocking.
+            if images % 5 == 0 and not cv_queue.full():
+                cv_queue.put_nowait(raw_bytes)
+
+            with cv_lock:
+                result = cv_result[0]
+
+            if result is not None:
+                annotated_frame, bb = result
+                sys.stdout.buffer.write(annotated_frame.tobytes())
             else:
-                sys.stdout.buffer.write(im.getvalue())
-                sys.stdout.flush()
-        except KeyboardInterrupt:
-            time_end = time.time()
-            seconds = time_end - time_start
-            print("Processed images {}".format(images), file=sys.stderr)
-            print("This is {:.2f}".format(images/seconds), file=sys.stderr)
-            sys.stderr.flush()
-            sys.exit()
-            #time.sleep(0.05)
+                sys.stdout.buffer.write(raw_bytes)
+            sys.stdout.flush()
+
+    except KeyboardInterrupt:
+        stop_event.set()
+        seconds = time.time() - time_start
+        print("Processed images {}".format(images), file=sys.stderr)
+        print("This is {:.2f} fps".format(images / seconds), file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit()
+
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
@@ -402,5 +502,3 @@ if __name__ == "__main__":
         make_sharpness_graph()
     if arguments.a:
         live_capture_autofocus()
-
-
