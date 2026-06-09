@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 import sys
 import time
+import collections
+from enum import Enum
 from pynput import keyboard
 import argparse
 
@@ -350,45 +352,252 @@ def live_capture():
             sys.exit()
             #time.sleep(0.05)
 
+class _AFState(Enum):
+    IDLE    = 'idle'    # in focus, monitoring for drift
+    SEEKING = 'seeking' # actively hill-climbing toward the sharpness peak
+
+
+class AutofocusController:
+    """Adaptive hill-climbing autofocus for cameras with only relative focus
+    stepping (near-small, near-large, far-small, far-large).
+
+    The lens has no absolute position readout, so we treat the problem as a
+    1-D hill-climb on the Laplacian-variance sharpness curve:
+
+    1.  IDLE  – smooth sharpness over a rolling window and track the peak.
+                When it drops by more than DRIFT_THRESHOLD, switch to SEEKING.
+    2.  SEEKING – issue one focus step per update() call in the current
+                direction.  If sharpness improves, keep going (switch to fine
+                steps once we are clearly climbing).  If it fails to improve
+                for NO_IMPROVE_PATIENCE ticks in a row, reverse direction.
+                After MAX_REVERSALS reversals with no new peak we declare
+                convergence and return to IDLE.
+
+    Call update(face_roi) periodically (every ~20 frames is a good cadence).
+    It issues at most one gphoto2 manualfocusdrive command per call.
+    """
+
+    # ---- tuning knobs -------------------------------------------------------
+    HISTORY_LEN          = 5     # frames to average (noise rejection)
+    DRIFT_THRESHOLD      = 0.05  # relative drop from peak that triggers SEEKING
+    COARSE_DROP_THRESHOLD = 0.30 # use large steps when drop exceeds this
+    NO_IMPROVE_PATIENCE  = 2     # consecutive non-improving ticks before reversing
+    MAX_REVERSALS        = 2     # reversals before giving up and going IDLE
+    # -------------------------------------------------------------------------
+
+    def __init__(self):
+        self._state              = _AFState.IDLE
+        self._history            = collections.deque(maxlen=self.HISTORY_LEN)
+        self._peak               = 0.0
+        self._direction          = True   # True = near (closer), False = far
+        self._small_step         = False  # start coarse
+        self._no_improve_streak  = 0
+        self._reversals          = 0
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def update(self, face_roi):
+        """Measure sharpness of *face_roi*, decide on a focus command, issue it.
+
+        Returns a short status string suitable for debug logging.
+        """
+        sharpness = self._measure(face_roi)
+        if sharpness is None:
+            return 'no_face'
+
+        self._history.append(sharpness)
+        smoothed = self._smoothed()
+
+        if self._state == _AFState.IDLE:
+            return self._tick_idle(smoothed)
+        else:
+            return self._tick_seeking(smoothed)
+
+    def reset(self):
+        """Call when the face is lost and reacquired so history is fresh."""
+        self._state             = _AFState.IDLE
+        self._history.clear()
+        self._peak              = 0.0
+        self._no_improve_streak = 0
+        self._reversals         = 0
+        print('[AF] reset', file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _measure(face_roi):
+        """Laplacian variance on the central 60 % of the face ROI.
+
+        Cropping inward avoids the green bounding-box pixels drawn by OpenCV
+        and the chromatic aberration that is worst at the lens edge.
+        """
+        if face_roi is None or face_roi.size == 0:
+            return None
+        h, w = face_roi.shape[:2]
+        ch = max(1, int(h * 0.3))
+        cw = max(1, int(w * 0.3))
+        cy, cx = h // 2, w // 2
+        crop = face_roi[cy - ch:cy + ch, cx - cw:cx + cw]
+        if crop.size == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _smoothed(self):
+        return sum(self._history) / len(self._history) if self._history else 0.0
+
+    def _tick_idle(self, smoothed):
+        # Update running peak
+        if smoothed > self._peak:
+            self._peak = smoothed
+
+        # Wait until history is fully populated before acting
+        if len(self._history) < self.HISTORY_LEN:
+            return 'warming_up'
+
+        drop = (self._peak - smoothed) / max(self._peak, 1e-9)
+        if drop > self.DRIFT_THRESHOLD:
+            self._state             = _AFState.SEEKING
+            self._no_improve_streak = 0
+            self._reversals         = 0
+            # Use coarse steps when far out of focus, fine steps when close
+            self._small_step = drop < self.COARSE_DROP_THRESHOLD
+            print(f'[AF] drift {drop:.1%} -> SEEKING '
+                  f'(small_step={self._small_step})', file=sys.stderr)
+            self._issue_step()
+            return 'seek_start'
+
+        return 'idle'
+
+    def _tick_seeking(self, smoothed):
+        if smoothed > self._peak:
+            # Genuine improvement – update peak, reset patience counter
+            self._peak              = smoothed
+            self._no_improve_streak = 0
+            # Once we are clearly climbing, switch to fine steps for precision
+            if not self._small_step:
+                self._small_step = True
+                print(f'[AF] improving ({smoothed:.1f}), switching to fine steps',
+                      file=sys.stderr)
+        else:
+            self._no_improve_streak += 1
+
+        if self._no_improve_streak >= self.NO_IMPROVE_PATIENCE:
+            if self._reversals >= self.MAX_REVERSALS:
+                # Searched both directions enough – accept current position
+                self._state = _AFState.IDLE
+                self._no_improve_streak = 0
+                print(f'[AF] converged (peak={self._peak:.1f})', file=sys.stderr)
+                return 'converged'
+            # Reverse and go coarse again
+            self._direction         = not self._direction
+            self._small_step        = False
+            self._no_improve_streak = 0
+            self._reversals        += 1
+            d = 'near' if self._direction else 'far'
+            print(f'[AF] reversing -> {d}  (reversal #{self._reversals})',
+                  file=sys.stderr)
+
+        self._issue_step()
+        return 'seeking'
+
+    def _issue_step(self):
+        focus(closer=self._direction, small_step=self._small_step)
+        d = 'near' if self._direction else 'far'
+        s = 'small' if self._small_step else 'large'
+        print(f'[AF] step {d}-{s}  smoothed={self._smoothed():.1f}  peak={self._peak:.1f}',
+              file=sys.stderr)
+
+
+# How many tracker updates to skip between autofocus evaluations.
+# At 15 fps with tracker running every 5 frames that is ~1.3 s per AF tick –
+# long enough for the lens to settle and the sharpness history to stabilise.
+_AF_INTERVAL = 4
+
+
 def live_capture_autofocus():
-    images = 0
-    tracker_initialized = False
-    time_start = time.time()
+    images           = 0
+    time_start       = time.time()
+    af               = AutofocusController()
+    local_tracker    = cv2.TrackerMOSSE_create()
+    tracker_ok       = False
+    face_roi         = None
+    ticks_since_af   = 0
+
     ensure_capture_to_RAM()
-    im, face, bb = capture_face(camera)
-    if bb is not None:
-        tracker.init(face, bb)
-        tracker_initialized = True
+
+    # Seed the tracker with the first detected face, if any
+    raw = get_preview_as_image(camera, raw=True)
+    if raw is not None:
+        raw_bytes   = raw.getvalue()
+        full_frame  = cv2.cvtColor(
+            np.array(Image.open(io.BytesIO(raw_bytes))), cv2.COLOR_RGB2BGR)
+        pil_image   = Image.open(io.BytesIO(raw_bytes))
+        pil_image.load()
+        det = get_face(pil_image, debug=True, BB=True)
+        if det is not None:
+            _, bb = det
+            local_tracker.init(full_frame, bb)  # tracker needs the *full* frame
+            tracker_ok = True
+            print('[AF] tracker seeded at startup', file=sys.stderr)
 
     while True:
         try:
-            # output with detected face            
-            last_face = face     
-            im = get_preview_as_image(camera, raw=True)     
-            images += 1 
-            if images % 5 == 0:                         
-                if not tracker_initialized:
-                    im, face, bb = capture_face(camera, im)                        
-                    tracker.init(face, bb)                            
-                frame = cv2.cvtColor(np.array(Image.open(im)), cv2.COLOR_RGB2BGR)  
-                (success, box) = tracker.update(frame)
-                if success:
-                    (x, y, w, h) = [int(v) for v in box]
-                    print(f"rect {(x, y)}, {(x + w, y + h)}", file=sys.stderr)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2) 
-                sys.stdout.buffer.write(frame.tostring())
-                sys.stdout.flush()
-            else:
-                sys.stdout.buffer.write(im.getvalue())
-                sys.stdout.flush()
+            raw = get_preview_as_image(camera, raw=True)
+            if raw is None:
+                continue
+            raw_bytes = raw.getvalue()
+            images   += 1
+
+            # Run tracker every 5 frames to keep overhead low
+            if images % 5 == 0:
+                full_frame = cv2.cvtColor(
+                    np.array(Image.open(io.BytesIO(raw_bytes))), cv2.COLOR_RGB2BGR)
+
+                if not tracker_ok:
+                    # Lost the subject – try Haar to reinitialise
+                    pil_image = Image.open(io.BytesIO(raw_bytes))
+                    pil_image.load()
+                    det = get_face(pil_image, debug=True, BB=True)
+                    if det is not None:
+                        _, bb = det
+                        local_tracker = cv2.TrackerMOSSE_create()
+                        local_tracker.init(full_frame, bb)
+                        tracker_ok = True
+                        af.reset()
+                        print('[AF] tracker re-seeded after loss', file=sys.stderr)
+
+                if tracker_ok:
+                    success, box = local_tracker.update(full_frame)
+                    if success:
+                        x, y, w, h = (int(v) for v in box)
+                        face_roi = full_frame[y:y + h, x:x + w]
+                        print(f'[tracker] face at ({x},{y}) size {w}x{h}',
+                              file=sys.stderr)
+                        ticks_since_af += 1
+                        if ticks_since_af >= _AF_INTERVAL:
+                            af.update(face_roi)
+                            ticks_since_af = 0
+                    else:
+                        tracker_ok = False
+                        face_roi   = None
+                        print('[tracker] lost subject', file=sys.stderr)
+
+            # Always output the original JPEG bytes so the stream stays
+            # compatible with the ffmpeg pipeline in the README.
+            sys.stdout.buffer.write(raw_bytes)
+            sys.stdout.flush()
+
         except KeyboardInterrupt:
-            time_end = time.time()
-            seconds = time_end - time_start
-            print("Processed images {}".format(images), file=sys.stderr)
-            print("This is {:.2f}".format(images/seconds), file=sys.stderr)
+            seconds = time.time() - time_start
+            print('Processed images {}'.format(images), file=sys.stderr)
+            print('This is {:.2f} fps'.format(images / seconds), file=sys.stderr)
             sys.stderr.flush()
             sys.exit()
-            #time.sleep(0.05)
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
